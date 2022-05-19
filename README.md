@@ -1,0 +1,4 @@
+- 👋 Hi, I’m @tahaontech
+- 👀 I’m interested in technology such as AI, Web 3.0, Mixed reality(vr/ar), ...
+- 🌱 I’m currently working on my startups (one in AI industry another in Web 3.0)
+- 📫 How to reach me tahatechbusiness@gmail.com
