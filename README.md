@@ -19,7 +19,7 @@
 
 - 💬 Ask me about **Software**
 
-- ❤️ Interested in Scala language
+- ❤️ Interested in Rust language
 
 - 📫 How to reach me **thhk2831@gmail.com**
 
