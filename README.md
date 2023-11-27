@@ -48,7 +48,7 @@
 <h3 align="left"><a href="https://wakatime.com/@tahaontech" target="blank"><img align="center" src="https://wakatime.com/static/img/wakatime.svg" alt="tahaontech" height="30" width="30" /></a>
  WakaTime Activity: <img align="center" src="https://wakatime.com/badge/user/8ae20db9-dc46-4492-a1f3-7d2ef51f724e.svg" alt="tahaontech" />
  </h3>
-<img align="center" src="https://wakatime.com/share/@tahaontech/8ae20db9-dc46-4492-a1f3-7d2ef51f724e.svg" alt="tahaontech" />
+<img align="center" src="https://wakatime.com/share/@8ae20db9-dc46-4492-a1f3-7d2ef51f724e/c68fd09d-25a2-4de1-adfb-867d288e7a93.svg" alt="tahaontech" />
 
 
 
