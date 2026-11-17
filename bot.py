@@ -68,966 +68,422 @@ STATE_FILE = os.getenv(
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
 API_LIMIT = int(os.getenv("API_LIMIT", "1000"))
-
-API_TIMEOUT = float(os.getenv("API_TIMEOUT", "20"))
-TELEGRAM_TIMEOUT = float(os.getenv("TELEGRAM_TIMEOUT", "15"))
-
-TELEGRAM_RETRIES = int(os.getenv("TELEGRAM_RETRIES", "5"))
-
+API_PAGE_SIZE = min(1000, max(1, int(os.getenv("API_PAGE_SIZE", "1000"))))
+STATE_FILE = Path(os.getenv("NOTIFIER_STATE_FILE", "notifier_state.json"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-MAX_TELEGRAM_TEXT = 3900
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+API_TIMEOUT = 20
+TELEGRAM_TIMEOUT = 20
+MAX_TELEGRAM_TEXT = 3900  # below Telegram's 4096-character limit
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
+log = logging.getLogger("TradingTelegramNotifier")
 
-logger = logging.getLogger("TradingTelegramNotifier")
 
-
-# ============================================================
-# DATA MODELS
-# ============================================================
-
-@dataclass
-class LogRecord:
-    id: int
-    timestamp: str
-    source: str
-    message: str
-    process: str = ""
-
+# ---------------------------------------------------------------------------
+# Event classification
+# ---------------------------------------------------------------------------
 
 @dataclass
-class Notification:
+class Alert:
     title: str
     emoji: str
-    message: str
+    details: str
 
 
-# ============================================================
-# PERSISTENT STATE
-# ============================================================
+def parse_pnl(message: str) -> str | None:
+    """Extract a PnL-like value from common log formats, without guessing."""
+    patterns = [
+        r"\bPnL\s*[:=]\s*([-+]?\d+(?:[.,]\d+)?)",
+        r"\bprofit\s*[:=]\s*([-+]?\d+(?:[.,]\d+)?)",
+        r"\bprofit\s+([-+]?\d+(?:[.,]\d+)?)",
+        r"\bP/L\s*[:=]\s*([-+]?\d+(?:[.,]\d+)?)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).replace(",", ".")
+    return None
 
-class PersistentState:
+
+def classify_log(message: str) -> Alert | None:
     """
-    Persists the last successfully handled API log ID.
-
-    The state file is written atomically to reduce the chance
-    of corruption if the process stops during a write.
+    Only notify on meaningful execution/position lifecycle events.
+    Routine state-machine messages, zone touches and strategy diagnostics
+    are intentionally ignored.
     """
+    m = message.strip()
+    upper = m.upper()
 
-    def __init__(self, path: str):
-        self.path = Path(path).expanduser().resolve()
-        self.last_id: Optional[int] = None
+    # Confirmed entry execution (not merely a signal/trigger).
+    if "[ORDER EXEC]" in upper:
+        return Alert("ORDER EXECUTED", "🟢", m)
 
-        self.load()
-
-    def load(self) -> None:
-        if not self.path.exists():
-            logger.info("No previous state file found.")
-            return
-
+    # Confirmed closure only. Touch/trigger messages are not proof of closure.
+    if "[POSITION CLOSED]" in upper:
+        pnl = parse_pnl(m)
+        if pnl is None:
+            return Alert("POSITION CLOSED", "⚪", m)
         try:
-            with self.path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
+            value = float(pnl)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return Alert("POSITION CLOSED · PROFIT", "💰", m)
+        if value < 0:
+            return Alert("POSITION CLOSED · LOSS", "🔴", m)
+        return Alert("POSITION CLOSED · BREAKEVEN", "⚪", m)
 
-            value = data.get("last_id")
+    # Connection/recovery information.
+    if "[RECONNECTED]" in upper:
+        return Alert("MT5 RECONNECTED", "🔄", m)
 
-            if value is not None:
-                self.last_id = int(value)
+    # Explicit execution/closure failures and uncertain closure states.
+    failure_markers = (
+        "[ORDER FAILED]",
+        "[ORDER ERROR]",
+        "[CLOSE FAILED]",
+        "[CLOSE ERROR]",
+        "[CLOSE UNVERIFIED]",
+        "[UNEXPECTED ERROR]",
+    )
+    if any(marker in upper for marker in failure_markers):
+        return Alert("TRADING BOT ERROR", "⚠️", m)
 
-            logger.info(
-                "State loaded. Last processed ID: %s",
-                self.last_id
-            )
+    if "REMAINS ACTIVE IN MT5 TERMINAL" in upper or "REMAINS ACTIVE IN MT5" in upper:
+        return Alert("POSITION STILL ACTIVE", "⚠️", m)
 
-        except Exception:
-            logger.exception(
-                "Could not read state file: %s",
-                self.path
-            )
-            raise
-
-    def save(self) -> None:
-        self.path.parent.mkdir(
-            parents=True,
-            exist_ok=True
+    if (
+        "[ERROR]" in upper
+        and (
+            "COULD NOT INITIALIZE MT5" in upper
+            or "WARMUP FAILED" in upper
+            or "TERMINAL DISCONNECTED" in upper
         )
-
-        data = {
-            "last_id": self.last_id,
-            "updated_at": time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ",
-                time.gmtime()
-            )
-        }
-
-        temp_path = None
-
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=str(self.path.parent),
-                delete=False
-            ) as f:
-                json.dump(
-                    data,
-                    f,
-                    indent=2,
-                    ensure_ascii=False
-                )
-
-                f.flush()
-                os.fsync(f.fileno())
-
-                temp_path = f.name
-
-            os.replace(temp_path, self.path)
-
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-
-    def advance(self, log_id: int) -> None:
-        if self.last_id is None or log_id > self.last_id:
-            self.last_id = log_id
-            self.save()
-
-
-# ============================================================
-# API CLIENT
-# ============================================================
-
-class LogAPIClient:
-
-    def __init__(
-        self,
-        url: str,
-        token: str,
-        timeout: float = 20,
-        limit: int = 1000
     ):
-        if not url:
-            raise ValueError("LOG_API_URL is required.")
+        return Alert("MT5 / BOT ERROR", "🚨", m)
 
-        if not token:
-            raise ValueError("LOG_API_TOKEN is required.")
+    return None
 
-        self.url = url
-        self.timeout = timeout
-        self.limit = min(max(limit, 1), 1000)
 
+# ---------------------------------------------------------------------------
+# API client
+# ---------------------------------------------------------------------------
+
+class LogsAPI:
+    def __init__(self, base_url: str, token: str) -> None:
+        self.url = f"{base_url}/api/logs"
         self.session = requests.Session()
-
         self.session.headers.update({
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "User-Agent": "TradingTelegramNotifier/1.0"
+            "User-Agent": "RavensTradingTelegramNotifier/1.0",
         })
 
-    def fetch_page(self, offset: int) -> list[LogRecord]:
-
-        response = self.session.get(
-            self.url,
-            params={
-                "limit": self.limit,
-                "offset": offset
-            },
-            timeout=self.timeout
-        )
+    def get_page(self, limit: int, offset: int) -> dict[str, Any]:
+        try:
+            response = self.session.get(
+                self.url,
+                params={"limit": limit, "offset": offset},
+                timeout=API_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Could not reach logs API: {exc}") from exc
 
         if response.status_code == 401:
+            # Never print the Authorization header or token.
             raise RuntimeError(
-                "API authentication failed. Check LOG_API_TOKEN."
+                "API returned HTTP 401 Unauthorized. The Bearer token sent by "
+                "this script does not match the server's API_TOKEN, or the "
+                "request is reaching a different server/environment."
             )
-
-        response.raise_for_status()
+        if response.status_code == 403:
+            raise RuntimeError("API returned HTTP 403 Forbidden.")
+        if not response.ok:
+            body = response.text[:500].replace("\n", " ")
+            raise RuntimeError(f"Logs API returned HTTP {response.status_code}: {body}")
 
         try:
-            payload = response.json()
+            data = response.json()
         except ValueError as exc:
-            raise RuntimeError(
-                "API returned invalid JSON."
-            ) from exc
+            raise RuntimeError("Logs API did not return valid JSON.") from exc
 
-        if not isinstance(payload, dict):
-            raise RuntimeError(
-                "Unexpected API response: expected a JSON object."
-            )
+        if not isinstance(data, dict) or not isinstance(data.get("logs"), list):
+            raise RuntimeError("Unexpected API response. Expected an object with a 'logs' array.")
+        return data
 
-        raw_logs = payload.get("logs")
+    def fetch_latest_snapshot(self, page_size: int) -> list[dict[str, Any]]:
+        """
+        Fetch a snapshot using the server's offset pagination.
+        The server returns each page in ascending order, but pages themselves
+        are ordered newest-first by offset; combine and sort by id afterwards.
+        """
+        first = self.get_page(page_size, 0)
+        total = int(first.get("total", 0) or 0)
+        rows: list[dict[str, Any]] = list(first["logs"])
 
-        if not isinstance(raw_logs, list):
-            raise RuntimeError(
-                "API response does not contain a valid 'logs' array."
-            )
+        # The total is captured on the first request. Offset pages may shift
+        # slightly if new records arrive while paging; ID deduplication/sorting
+        # protects against duplicates. The next poll will catch recent inserts.
+        offset = page_size
+        while offset < total:
+            page = self.get_page(page_size, offset)
+            page_rows = page["logs"]
+            if not page_rows:
+                break
+            rows.extend(page_rows)
+            offset += page_size
 
-        records = []
-
-        for item in raw_logs:
-
-            if not isinstance(item, dict):
-                logger.warning(
-                    "Ignoring malformed log record: %r",
-                    item
-                )
-                continue
-
+        unique: dict[int, dict[str, Any]] = {}
+        for row in rows:
             try:
-                log_id = int(item["id"])
-                message = str(item["message"])
-
+                unique[int(row["id"])] = row
             except (KeyError, TypeError, ValueError):
-                logger.warning(
-                    "Ignoring log without valid id/message: %r",
-                    item
-                )
-                continue
+                log.warning("Ignoring API log row without a valid integer id.")
+        return [unique[key] for key in sorted(unique)]
 
-            records.append(
-                LogRecord(
-                    id=log_id,
-                    timestamp=str(item.get("timestamp") or ""),
-                    source=str(item.get("source") or ""),
-                    message=message,
-                    process=str(item.get("process") or "")
-                )
-            )
 
-        return records
-
-    def fetch_new_logs(
-        self,
-        last_id: int,
-        from_start: bool = False
-    ) -> list[LogRecord]:
-        """
-        The provided API uses offset pagination.
-
-        Its SQL query orders records DESC, then reverses each
-        page before returning it.
-
-        We therefore:
-          1. Fetch pages starting at offset 0.
-          2. Keep records with ID > last_id.
-          3. Continue until we reach a page containing old IDs.
-          4. Sort all new records by ID ascending.
-
-        This supports backlogs larger than one API page.
-        """
-
-        offset = 0
-        collected: dict[int, LogRecord] = {}
-
-        while True:
-
-            page = self.fetch_page(offset)
-
-            if not page:
-                break
-
-            page.sort(key=lambda item: item.id)
-
-            for record in page:
-                if record.id > last_id:
-                    collected[record.id] = record
-
-            page_min_id = page[0].id
-            page_max_id = page[-1].id
-
-            logger.debug(
-                "Fetched API page offset=%s count=%s min_id=%s max_id=%s",
-                offset,
-                len(page),
-                page_min_id,
-                page_max_id
-            )
-
-            # We have reached the previous cursor.
-            if page_min_id <= last_id:
-                break
-
-            # There are no more pages.
-            if len(page) < self.limit:
-                break
-
-            offset += self.limit
-
-        return sorted(
-            collected.values(),
-            key=lambda item: item.id
-        )
-
-    def get_latest_id(self) -> int:
-        """
-        Gets the latest available log ID.
-
-        Used for initial startup when --from-start is not enabled.
-        """
-
-        page = self.fetch_page(0)
-
-        if not page:
-            return 0
-
-        return max(record.id for record in page)
-
-    def close(self) -> None:
-        self.session.close()
-
-
-# ============================================================
-# IMPORTANT EVENT CLASSIFICATION
-# ============================================================
-
-class TradingEventParser:
-
-    # Explicit execution events.
-    ORDER_EXEC_PATTERNS = [
-        r"\[ORDER\s+EXEC\]",
-        r"\bORDER\s+EXECUTED\b",
-        r"\bORDER\s+FILLED\b",
-        r"\bTRADE\s+EXECUTED\b",
-        r"\bEXECUTION\s+CONFIRMED\b",
-        r"\bDEAL\s+EXECUTED\b",
-    ]
-
-    # Stop-loss and take-profit events.
-    SL_PATTERNS = [
-        r"\bSL\s+HIT\b",
-        r"\bSTOP[\s_-]*LOSS\s+(?:HIT|TRIGGERED|EXECUTED)\b",
-        r"\bSTOPPED\s+OUT\b",
-        r"\bSL\s+(?:CLOSED|EXECUTED)\b",
-    ]
-
-    TP_PATTERNS = [
-        r"\bTP\s+HIT\b",
-        r"\bTAKE[\s_-]*PROFIT\s+(?:HIT|TRIGGERED|EXECUTED)\b",
-        r"\bTARGET\s+(?:HIT|REACHED)\b",
-        r"\bTP\s+(?:CLOSED|EXECUTED)\b",
-    ]
-
-    # Position lifecycle events.
-    POSITION_OPEN_PATTERNS = [
-        r"\bPOSITION\s+(?:OPENED|OPEN)\b",
-        r"\bPOSITION\s+ENTERED\b",
-        r"\bOPEN(?:ED)?\s+POSITION\b",
-        r"\bENTRY\s+EXECUTED\b",
-        r"\bENTERED\s+(?:LONG|SHORT)\b",
-    ]
-
-    POSITION_CLOSE_PATTERNS = [
-        r"\bPOSITION\s+(?:CLOSED|EXITED)\b",
-        r"\bCLOSE(?:D)?\s+POSITION\b",
-        r"\bPOSITION\s+EXIT\b",
-        r"\bEXIT\s+EXECUTED\b",
-        r"\bTRADE\s+CLOSED\b",
-        r"\bCLOSE\s+EXECUTED\b",
-    ]
-
-    STATE_PATTERN = re.compile(
-        r"\[STATE\s+(.+?)\s*->\s*(.+?)\]",
-        re.IGNORECASE
-    )
-
-    POSITION_TERMS = (
-        "IN_POS",
-        "IN POS",
-        "POSITION",
-        "LONG",
-        "SHORT",
-        "FLAT",
-        "EXIT",
-        "CLOSED",
-        "OPEN",
-        "STOP",
-        "TARGET",
-        "TP",
-        "SL",
-    )
-
-    @staticmethod
-    def matches_any(
-        message: str,
-        patterns: list[str]
-    ) -> bool:
-
-        return any(
-            re.search(pattern, message, re.IGNORECASE)
-            for pattern in patterns
-        )
-
-    @classmethod
-    def parse(
-        cls,
-        record: LogRecord
-    ) -> Optional[Notification]:
-
-        message = record.message.strip()
-
-        if not message:
-            return None
-
-        # ----------------------------------------------------
-        # 1. Stop loss
-        # ----------------------------------------------------
-
-        if cls.matches_any(message, cls.SL_PATTERNS):
-
-            return Notification(
-                title="STOP LOSS HIT",
-                emoji="🛑",
-                message=message
-            )
-
-        # ----------------------------------------------------
-        # 2. Take profit
-        # ----------------------------------------------------
-
-        if cls.matches_any(message, cls.TP_PATTERNS):
-
-            return Notification(
-                title="TAKE PROFIT HIT",
-                emoji="🎯",
-                message=message
-            )
-
-        # ----------------------------------------------------
-        # 3. Order execution
-        # ----------------------------------------------------
-
-        if cls.matches_any(message, cls.ORDER_EXEC_PATTERNS):
-
-            return Notification(
-                title="ORDER EXECUTED",
-                emoji="⚡",
-                message=message
-            )
-
-        # ----------------------------------------------------
-        # 4. Position closed
-        # ----------------------------------------------------
-
-        if cls.matches_any(
-            message,
-            cls.POSITION_CLOSE_PATTERNS
-        ):
-
-            return Notification(
-                title="POSITION CLOSED",
-                emoji="🔴",
-                message=message
-            )
-
-        # ----------------------------------------------------
-        # 5. Position opened
-        # ----------------------------------------------------
-
-        if cls.matches_any(
-            message,
-            cls.POSITION_OPEN_PATTERNS
-        ):
-
-            return Notification(
-                title="POSITION OPENED",
-                emoji="🟢",
-                message=message
-            )
-
-        # ----------------------------------------------------
-        # 6. Meaningful state transitions
-        # ----------------------------------------------------
-
-        state_match = cls.STATE_PATTERN.search(message)
-
-        if state_match:
-
-            old_state = state_match.group(1).strip()
-            new_state = state_match.group(2).strip()
-
-            combined = (
-                old_state + " " + new_state
-            ).upper()
-
-            is_position_related = any(
-                term in combined
-                for term in cls.POSITION_TERMS
-            )
-
-            if is_position_related:
-
-                return Notification(
-                    title="POSITION STATE CHANGED",
-                    emoji="🔄",
-                    message=message
-                )
-
-        # ----------------------------------------------------
-        # 7. Ignore everything else
-        # ----------------------------------------------------
-
-        return None
-
-
-# ============================================================
-# TELEGRAM CLIENT
-# ============================================================
+# ---------------------------------------------------------------------------
+# Telegram client
+# ---------------------------------------------------------------------------
 
 class TelegramClient:
-
-    def __init__(
-        self,
-        bot_token: str,
-        chat_id: str,
-        timeout: float = 15,
-        retries: int = 5
-    ):
-
-        if not bot_token:
-            raise ValueError(
-                "TELEGRAM_BOT_TOKEN is required."
-            )
-
-        if not chat_id:
-            raise ValueError(
-                "TELEGRAM_CHAT_ID is required."
-            )
-
+    def __init__(self, bot_token: str, chat_id: str) -> None:
+        self.url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         self.chat_id = chat_id
-        self.timeout = timeout
-        self.retries = max(retries, 1)
-
-        self.url = (
-            f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        )
-
         self.session = requests.Session()
 
     @staticmethod
-    def build_message(
-        record: LogRecord,
-        notification: Notification
-    ) -> str:
+    def _safe_text(value: Any) -> str:
+        return html.escape(str(value if value is not None else "—"), quote=False)
 
-        # Truncate the raw log before HTML escaping.
-        raw_message = notification.message
+    def send(self, alert: Alert, row: dict[str, Any]) -> None:
+        timestamp = row.get("timestamp") or "Unknown time"
+        process = row.get("process") or "app"
+        source = row.get("source") or "stdout"
 
-        if len(raw_message) > 3300:
-            raw_message = (
-                raw_message[:3300] + "\n...[truncated]"
-            )
-
-        safe_message = html.escape(raw_message)
-
-        safe_timestamp = html.escape(
-            record.timestamp or "Unknown"
-        )
-
-        safe_source = html.escape(
-            record.source or "Unknown"
-        )
-
-        safe_process = html.escape(
-            record.process or "Unknown"
-        )
+        # Escape every dynamic value. Do not truncate the final HTML string,
+        # which could cut through an HTML tag and make Telegram reject it.
+        details = alert.details
+        available = 2500
+        if len(details) > available:
+            details = details[:available - 20] + "\n… [truncated]"
 
         text = (
-            f"{notification.emoji} "
-            f"<b>{html.escape(notification.title)}</b>\n"
-            f"\n"
-            f"<b>Log ID:</b> <code>{record.id}</code>\n"
-            f"<b>Time:</b> {safe_timestamp}\n"
-            f"<b>Source:</b> {safe_source}\n"
-            f"<b>Process:</b> {safe_process}\n"
-            f"\n"
-            f"<pre>{safe_message}</pre>"
+            f"{alert.emoji} <b>{self._safe_text(alert.title)}</b>\n"
+            f"<b>Time:</b> {self._safe_text(timestamp)}\n"
+            f"<b>Process:</b> {self._safe_text(process)}\n"
+            f"<b>Source:</b> {self._safe_text(source)}\n"
+            f"<b>Log ID:</b> {self._safe_text(row.get('id'))}\n\n"
+            f"<pre>{self._safe_text(details)}</pre>"
         )
-
         if len(text) > MAX_TELEGRAM_TEXT:
-            text = text[:MAX_TELEGRAM_TEXT - 30]
-            text += "\n...[truncated]</pre>"
-
-        return text
-
-    def send(
-        self,
-        record: LogRecord,
-        notification: Notification
-    ) -> bool:
-
-        text = self.build_message(
-            record,
-            notification
-        )
+            # This is a final safety net; details are already bounded.
+            text = text[:MAX_TELEGRAM_TEXT]
 
         payload = {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True
+            "disable_web_page_preview": True,
         }
 
-        for attempt in range(1, self.retries + 1):
-
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
             try:
-
                 response = self.session.post(
                     self.url,
                     json=payload,
-                    timeout=self.timeout
+                    timeout=TELEGRAM_TIMEOUT,
                 )
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = {}
 
-                if response.status_code == 429:
+                if response.ok and data.get("ok") is True:
+                    return
 
-                    try:
-                        retry_after = int(
-                            response.json()
-                            .get("parameters", {})
-                            .get("retry_after", 5)
-                        )
-                    except Exception:
-                        retry_after = 5
-
-                    logger.warning(
-                        "Telegram rate limited. Waiting %s seconds.",
-                        retry_after
-                    )
-
-                    time.sleep(retry_after)
-                    continue
-
-                response.raise_for_status()
-
-                result = response.json()
-
-                if not result.get("ok"):
-                    raise RuntimeError(
-                        f"Telegram rejected message: {result}"
-                    )
-
-                logger.info(
-                    "Telegram notification sent. Log ID=%s Type=%s",
-                    record.id,
-                    notification.title
+                description = data.get("description") or response.text[:300]
+                last_error = RuntimeError(
+                    f"Telegram HTTP {response.status_code}: {description}"
                 )
+            except requests.RequestException as exc:
+                last_error = exc
 
-                return True
+            if attempt < 3:
+                time.sleep(attempt * 2)
 
-            except Exception as exc:
-
-                logger.warning(
-                    "Telegram delivery failed. Attempt %s/%s: %s",
-                    attempt,
-                    self.retries,
-                    exc
-                )
-
-                if attempt < self.retries:
-                    time.sleep(min(2 ** attempt, 30))
-
-        logger.error(
-            "Telegram delivery permanently failed for log ID=%s",
-            record.id
-        )
-
-        return False
-
-    def close(self) -> None:
-        self.session.close()
+        raise RuntimeError(f"Could not send Telegram message: {last_error}")
 
 
-# ============================================================
-# NOTIFIER ENGINE
-# ============================================================
+# ---------------------------------------------------------------------------
+# Persistent cursor
+# ---------------------------------------------------------------------------
 
-class TradingNotifier:
+def load_last_id() -> int | None:
+    if not STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        value = data.get("last_id")
+        return int(value) if value is not None else None
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        log.warning("State file is invalid; starting with a fresh cursor.")
+        return None
 
-    def __init__(
-        self,
-        api: LogAPIClient,
-        telegram: TelegramClient,
-        state: PersistentState,
-        from_start: bool = False
-    ):
 
-        self.api = api
-        self.telegram = telegram
-        self.state = state
+def save_last_id(last_id: int) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = STATE_FILE.with_suffix(STATE_FILE.suffix + ".tmp")
+    temp_file.write_text(
+        json.dumps({"last_id": last_id}, indent=2),
+        encoding="utf-8",
+    )
+    temp_file.replace(STATE_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Notifier
+# ---------------------------------------------------------------------------
+
+class Notifier:
+    def __init__(self, from_start: bool = False) -> None:
+        self.api = LogsAPI(API_URL, API_TOKEN)
+        self.telegram = TelegramClient(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        self.last_id = load_last_id()
         self.from_start = from_start
+        self.initialized = self.last_id is not None
 
-    def initialize(self) -> None:
+    def poll_once(self) -> int:
+        rows = self.api.fetch_latest_snapshot(API_PAGE_SIZE)
+        if not rows:
+            log.info("No log records returned by API.")
+            return 0
 
-        if self.state.last_id is not None:
-            return
+        newest_id = max(int(row["id"]) for row in rows)
 
-        if self.from_start:
-
-            self.state.last_id = 0
-            self.state.save()
-
-            logger.info(
-                "Initial cursor set to 0. Historical logs will be processed."
-            )
-
-        else:
-
-            latest_id = self.api.get_latest_id()
-
-            self.state.last_id = latest_id
-            self.state.save()
-
-            logger.info(
-                "Initial cursor set to latest ID=%s. "
-                "Only future logs will generate notifications.",
-                latest_id
-            )
-
-    def process_record(
-        self,
-        record: LogRecord
-    ) -> bool:
-
-        notification = TradingEventParser.parse(record)
-
-        if notification is None:
-
-            logger.debug(
-                "Ignoring routine log ID=%s: %s",
-                record.id,
-                record.message[:150]
-            )
-
-            # Intentionally filtered logs are acknowledged.
-            self.state.advance(record.id)
-
-            return True
-
-        logger.info(
-            "Important event detected. ID=%s Type=%s",
-            record.id,
-            notification.title
-        )
-
-        delivered = self.telegram.send(
-            record,
-            notification
-        )
-
-        if not delivered:
-
-            # Do not advance the cursor.
-            # This log will be retried on the next polling cycle.
-            return False
-
-        # Advance only after successful delivery.
-        self.state.advance(record.id)
-
-        return True
-
-    def poll_once(self) -> None:
-
-        last_id = self.state.last_id or 0
-
-        records = self.api.fetch_new_logs(
-            last_id=last_id
-        )
-
-        if not records:
-            logger.debug("No new logs.")
-            return
-
-        logger.info(
-            "Found %s new log records. Last ID=%s",
-            len(records),
-            records[-1].id
-        )
-
-        for record in records:
-
-            if self.state.last_id is not None:
-                if record.id <= self.state.last_id:
-                    continue
-
-            success = self.process_record(record)
-
-            if not success:
-
-                logger.error(
-                    "Stopping batch at ID=%s because notification "
-                    "delivery failed. Remaining logs will be retried.",
-                    record.id
+        # First launch: by default establish a baseline and do not send the
+        # entire historical log archive. --from-start opts into replaying it.
+        if not self.initialized:
+            if self.from_start:
+                self.last_id = 0
+                log.info("First launch with --from-start: processing retained logs.")
+            else:
+                self.last_id = newest_id
+                save_last_id(self.last_id)
+                self.initialized = True
+                log.info(
+                    "Initialized at latest log id %s; only future logs will notify.",
+                    newest_id,
                 )
+                return 0
 
-                break
+        assert self.last_id is not None
+        new_rows = [
+            row for row in rows
+            if int(row["id"]) > self.last_id
+        ]
 
-    def run(
-        self,
-        poll_interval: float,
-        once: bool = False
-    ) -> None:
+        sent = 0
+        for row in new_rows:
+            row_id = int(row["id"])
+            message = str(row.get("message") or "")
+            alert = classify_log(message)
 
-        self.initialize()
+            if alert is not None:
+                self.telegram.send(alert, row)
+                sent += 1
+                log.info("Telegram alert sent for log id=%s (%s).", row_id, alert.title)
+            else:
+                log.debug("Ignored log id=%s.", row_id)
 
-        logger.info("Trading Telegram Notifier started.")
-        logger.info("API: %s", self.api.url)
-        logger.info("Polling interval: %s seconds", poll_interval)
+            # Advance after each successfully handled record, including
+            # intentionally ignored records. If Telegram sending fails,
+            # cursor remains before this record so it is retried next poll.
+            self.last_id = row_id
+            save_last_id(self.last_id)
 
-        if once:
+        # If the latest rows include only IDs already processed, keep cursor.
+        # Do not advance over an unseen gap: it may be caused by API pagination
+        # shifting during concurrent inserts.
+        log.info(
+            "Fetched %d records; processed %d new records; sent %d alerts; cursor=%s",
+            len(rows), len(new_rows), sent, self.last_id,
+        )
+        return sent
 
-            self.poll_once()
-            return
+    def run(self, once: bool = False) -> None:
+        log.info("Notifier started.")
+        log.info("Logs endpoint: %s/api/logs", API_URL)
+        log.info("Polling interval: %ss", POLL_INTERVAL)
 
         while True:
-
+            started = time.monotonic()
             try:
                 self.poll_once()
+            except Exception as exc:
+                log.error("%s", exc)
 
-            except KeyboardInterrupt:
-                logger.info("Shutdown requested.")
-                break
+            if once:
+                return
 
-            except Exception:
-
-                logger.exception(
-                    "Polling failed. Will retry."
-                )
-
-            time.sleep(poll_interval)
+            elapsed = time.monotonic() - started
+            time.sleep(max(1, POLL_INTERVAL - elapsed))
 
 
-# ============================================================
-# CLI
-# ============================================================
+def validate_config() -> None:
+    missing = []
+    if not API_TOKEN:
+        missing.append("LOG_API_TOKEN (or API_TOKEN)")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        raise SystemExit("Missing configuration: " + ", ".join(missing))
 
-def parse_args():
 
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Trading Telegram Notifier"
+        description="Forward important trading bot log events to a Telegram group."
     )
-
-    parser.add_argument(
-        "--poll",
-        type=float,
-        default=POLL_INTERVAL,
-        help="Polling interval in seconds."
-    )
-
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=API_LIMIT,
-        help="API page size (maximum 1000)."
-    )
-
-    parser.add_argument(
-        "--state-file",
-        default=STATE_FILE,
-        help="Path to persistent JSON state file."
-    )
-
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Poll once and exit."
+        help="Fetch and process logs once, then exit.",
     )
-
     parser.add_argument(
         "--from-start",
         action="store_true",
-        help="Process historical logs on first startup."
+        help="On first run, replay the retained logs instead of setting a baseline.",
     )
-
-    return parser.parse_args()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    args = parse_args()
-
-    if args.poll <= 0:
-        raise ValueError("--poll must be greater than zero.")
-
-    if args.limit < 1:
-        raise ValueError("--limit must be at least 1.")
-
-    if not API_URL or not API_TOKEN:
-        raise RuntimeError(
-            "Set LOG_API_URL and LOG_API_TOKEN."
-        )
+    parser.add_argument(
+        "--test-telegram",
+        action="store_true",
+        help="Send a Telegram test message without calling the logs API.",
+    )
+    args = parser.parse_args()
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in your .env file.")
+
+    if args.test_telegram:
+        TelegramClient(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).send(
+            Alert("NOTIFIER TEST", "✅", "Telegram delivery is working."),
+            {"timestamp": time.strftime("%Y-%m-%d %H:%M:%S"), "process": "notifier",
+             "source": "system", "id": "test"},
         )
+        log.info("Telegram test message sent.")
+        return
 
-    api = LogAPIClient(
-        url=API_URL,
-        token=API_TOKEN,
-        timeout=API_TIMEOUT,
-        limit=args.limit
-    )
-
-    telegram = TelegramClient(
-        bot_token=TELEGRAM_BOT_TOKEN,
-        chat_id=TELEGRAM_CHAT_ID,
-        timeout=TELEGRAM_TIMEOUT,
-        retries=TELEGRAM_RETRIES
-    )
-
-    state = PersistentState(
-        path=args.state_file
-    )
-
-    notifier = TradingNotifier(
-        api=api,
-        telegram=telegram,
-        state=state,
-        from_start=args.from_start
-    )
-
-    try:
-
-        notifier.run(
-            poll_interval=args.poll,
-            once=args.once
-        )
-
-    finally:
-
-        api.close()
-        telegram.close()
-
-        logger.info("Notifier stopped.")
+    validate_config()
+    Notifier(from_start=args.from_start).run(once=args.once)
 
 
 if __name__ == "__main__":
-
-    try:
-        main()
-
-    except KeyboardInterrupt:
-        logger.info("Interrupted.")
-
-    except Exception as exc:
-        logger.critical(
-            "Fatal error: %s",
-            exc,
-            exc_info=True
-        )
-        sys.exit(1)
+    main()
