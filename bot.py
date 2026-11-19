@@ -47,19 +47,15 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_URL = os.getenv("LOG_API_URL", "https://ravens.ir").strip().rstrip("/")
-# The Node server calls this variable API_TOKEN. The Python client accepts
-# LOG_API_TOKEN (recommended) and API_TOKEN to make matching configuration easy.
-API_TOKEN = (
-    os.getenv("LOG_API_TOKEN")
-    or os.getenv("API_TOKEN")
-    or ""
-).strip()
+API_URL = os.getenv("LOG_API_URL", "https://ravens.ir").strip()
+API_TOKEN = os.getenv("LOG_API_TOKEN", "my-secret-static-token-2025").strip()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9185734396:AAE9G-ZpSY1irbiywhMu9mKoXoQcc-3XL30").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "-1003888529446").strip()
 
-POLL_INTERVAL = max(1, int(os.getenv("POLL_INTERVAL", "3")))
+
+
+POLL_INTERVAL = max(1, int(os.getenv("POLL_INTERVAL", "5")))
 API_PAGE_SIZE = min(1000, max(1, int(os.getenv("API_PAGE_SIZE", "1000"))))
 STATE_FILE = Path(os.getenv("NOTIFIER_STATE_FILE", "notifier_state.json"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
